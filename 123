@@ -142,8 +142,8 @@ local function getKnifeTool()
     local char = LocalPlayer.Character
     local held = char and char:FindFirstChildOfClass("Tool")
 
-    -- нож уже в руках — не трогаем
-    if held and isKnifeName(held) then
+    -- умный выбор: если что-то уже в руках (хоть слот 2) — не выдёргиваем
+    if held then
         return held
     end
 
@@ -450,19 +450,24 @@ end)
 RageTab:CreateSection("RageBot")
 
 local RB = {
-    Enabled    = false, -- мастер RageBot
-    ChargeTime = 1,     -- сколько держать ЛКМ перед броском (сек)
-    AimLead    = 0.4,   -- за сколько секунд до броска начинать наводку на голову
-    ShootWall  = true,  -- стрелять через стены
-    AimWall    = true,  -- наводить (выбирать цель) через стены
-    Predict    = true,  -- предиктить движение цели
-    KnifeSpeed = 120,   -- скорость полёта ножа для предикта (стад/сек)
-    FOV        = 350,   -- радиус FOV в пикселях (0 = без лимита)
-    ShowFOV    = true,  -- рисовать круг FOV
+    Enabled       = false, -- мастер RageBot
+    ChargeTime    = 1,     -- сколько держать ЛКМ перед броском (сек)
+    AimLead       = 0.7,   -- за сколько секунд до броска начинать наводку на голову
+    ShootWall     = true,  -- стрелять через стены
+    AimWall       = true,  -- наводить (выбирать цель) через стены
+    Predict       = true,  -- предиктить движение цели
+    AutoPredict   = true,  -- авто-замер скорости ножа (без ручной настройки)
+    MeasuredSpeed = nil,   -- измеренная скорость ножа (стад/сек)
+    KnifeSpeed    = 120,   -- скорость ножа вручную (если авто-предикт выключен)
+    FOV           = 350,   -- радиус FOV в пикселях (0 = без лимита)
+    ShowFOV       = true,  -- рисовать круг FOV
 }
+local autoSpeedLabel = nil -- лейбл с замеренной скоростью
 
 local holding = false -- ЛКМ зажата
 local holdStart = 0   -- когда зажали
+local lastThrowT = 0  -- время нашего последнего броска (для авто-замера)
+local lastRbEquip = 0 -- кулдаун быстрого взятия ножа в RageBot
 
 -- ---------- мышь (ЛКМ) ----------
 local function lmbPress()
@@ -538,8 +543,78 @@ local function isGodMode(targetChar, hum)
     return false
 end
 
+-- ---------- проверка прострела: стена / решётка / стекло ----------
+-- 5 параллельных лучей по ширине ножа: если часть проходит, а часть
+-- упирается — перед нами решётка/сетка/край (видно, но не простреливается).
+-- Возвращает: "clear" (открыто) / "solid" (сплошная стена) / "blocked" (решётка/стекло)
+local function checkShotPath(myRoot, targetRoot, targetChar)
+    local cam = workspace.CurrentCamera
+    local origin = (cam and cam.CFrame.Position) or myRoot.Position
+    local head = targetChar:FindFirstChild("Head")
+    local aim = head and head.Position or targetRoot.Position
+
+    local dir = aim - origin
+    if dir.Magnitude < 1 then
+        return "clear"
+    end
+
+    local ref = dir.Unit
+    local right = ref:Cross(Vector3.new(0, 1, 0))
+    if right.Magnitude < 0.05 then
+        right = ref:Cross(Vector3.new(1, 0, 0))
+    end
+    right = right.Unit
+    local up = ref:Cross(right).Unit
+    local offs = {
+        Vector3.new(0, 0, 0),
+        right * 0.6,
+        -right * 0.6,
+        up * 0.6,
+        -up * 0.6,
+    }
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+
+    local blocked, clear = 0, 0
+    local sawTransparent = false
+
+    for _, off in ipairs(offs) do
+        local o = origin + off
+        local a = aim + off
+        local hit = workspace:Raycast(o, a - o, params)
+        if not hit then
+            clear = clear + 1
+        elseif hit.Instance:IsDescendantOf(targetChar) or (hit.Position - a).Magnitude < 2 then
+            clear = clear + 1 -- добрались до цели
+        else
+            blocked = blocked + 1
+            local inst = hit.Instance
+            if inst:IsA("BasePart") and (inst.Transparency > 0.05 or inst.Material == Enum.Material.Glass) then
+                sawTransparent = true
+            end
+        end
+    end
+
+    if blocked == 0 then
+        return "clear"
+    end
+    if sawTransparent or clear > 0 then
+        -- стекло (видно, но не бьётся) либо решётка/сетка/край стены
+        return "blocked"
+    end
+    -- все лучи упёрлись в одно непрозрачное = сплошная стена
+    return "solid"
+end
+
+-- можно ли кидать при таком пути
+local function pathAllows(path)
+    return path == "clear" or (path == "solid" and RB.ShootWall)
+end
+
 -- ---------- выбор цели: живой враг в пределах FOV ----------
-local function pickTarget()
+local function pickTarget(avoidRoot)
     local char = LocalPlayer.Character
     local myRoot = char and char:FindFirstChild("HumanoidRootPart")
     local cam = workspace.CurrentCamera
@@ -556,7 +631,7 @@ local function pickTarget()
             local tc = plr.Character
             local hum = tc and tc:FindFirstChildOfClass("Humanoid")
             local root = tc and tc:FindFirstChild("HumanoidRootPart")
-            if hum and root and hum.Health > 0 and not isGodMode(tc, hum) then
+            if hum and root and hum.Health > 0 and not isGodMode(tc, hum) and root ~= avoidRoot then
                 local allowed = true
                 if not RB.AimWall then
                     allowed = isVisible(myRoot.Position, root, tc)
@@ -574,25 +649,32 @@ local function pickTarget()
     return bestRoot, bestChar
 end
 
--- ---------- куда целиться: ровно в голову цели ----------
-local function getAimBasePos(targetRoot, targetChar)
+-- ---------- куда целиться: ТОЛЬКО в голову цели ----------
+local function getAimBasePos(targetChar)
     local head = targetChar and targetChar:FindFirstChild("Head")
     if head and head:IsA("BasePart") then
         return head.Position
     end
-    return targetRoot.Position + Vector3.new(0, 1.5, 0) -- запасной вариант (головы нет)
+    return nil -- головы нет — не целимся и не кидаем (убиваем только в голову)
 end
 
--- ---------- предикт: куда кинуть, чтобы попасть в голову ----------
+-- ---------- предикт: куда кинуть, чтобы попасть именно в голову ----------
 local function computeAimPos(myRoot, targetRoot, targetChar)
-    local pos = getAimBasePos(targetRoot, targetChar)
+    local pos = getAimBasePos(targetChar)
+    if not pos then
+        return nil
+    end
     if RB.Predict then
+        -- скорость ножа: сначала авто-замер, иначе значение слайдера
+        local speed = (RB.AutoPredict and RB.MeasuredSpeed) or RB.KnifeSpeed
         local vel = targetRoot.AssemblyLinearVelocity or targetRoot.Velocity
         local dist = (pos - myRoot.Position).Magnitude
-        local t = dist / math.max(1, RB.KnifeSpeed)
-        pos = pos + vel * t
-        -- если нож летит по дуге — раскомментируй (прицел будет выше):
-        -- pos = pos + Vector3.new(0, 0.5 * workspace.Gravity * t * t, 0)
+        local t = dist / math.max(1, speed)
+        local predicted = pos + vel * t
+        -- ФИКС "кидает в пол": вертикаль ограничиваем ±5 стад от текущей головы,
+        -- иначе прыгающая/падающая цель уводит прицел в землю
+        local yOff = math.clamp(predicted.Y - pos.Y, -5, 5)
+        pos = Vector3.new(predicted.X, pos.Y + yOff, predicted.Z)
     end
     return pos
 end
@@ -601,6 +683,10 @@ end
 local function applySilentAim(aimPos)
     local cam = workspace.CurrentCamera
     if not cam then
+        return false
+    end
+    -- защита от NaN/мусора в координатах цели
+    if aimPos.X ~= aimPos.X or aimPos.Y ~= aimPos.Y or aimPos.Z ~= aimPos.Z then
         return false
     end
     local oldCF = cam.CFrame
@@ -629,6 +715,7 @@ end
 
 -- тихий бросок: ставим прицел и отпускаем ЛКМ в тот же момент
 local function silentThrow(aimPos)
+    lastThrowT = os.clock() -- старт окна для авто-замера скорости ножа
     applySilentAim(aimPos)
     lmbRelease()
 end
@@ -642,12 +729,12 @@ local function ragebotTick()
         return
     end
 
-    -- ножа в руках нет — пытаемся взять (1 слот)
-    local knife = char:FindFirstChildOfClass("Tool")
-    if not (knife and isKnifeName(knife)) then
-        if os.clock() - lastEquip > 0.4 then
+    -- в руках ничего нет — быстро берём нож (1 слот)
+    local heldTool = char:FindFirstChildOfClass("Tool")
+    if not heldTool then
+        if os.clock() - lastRbEquip > 0.1 then
             equipKnife()
-            lastEquip = os.clock()
+            lastRbEquip = os.clock()
         end
         releaseLMB()
         return
@@ -655,8 +742,14 @@ local function ragebotTick()
 
     local targetRoot, targetChar = pickTarget()
 
-    -- нож в руках — зажимаем ЛКМ и заряжаем
+    -- умный выбор: тул уже в руках (хоть слот 2) — просто наводим и держим ЛКМ
     if not holding then
+        -- направление запоминаем и в момент нажатия (на случай,
+        -- если игра читает его при зажатии, а не при отпускании)
+        local aim0 = targetRoot and computeAimPos(myRoot, targetRoot, targetChar)
+        if aim0 then
+            silentAim(aim0)
+        end
         lmbPress()
         holding = true
         holdStart = os.clock()
@@ -671,25 +764,55 @@ local function ragebotTick()
         return
     end
 
-    -- заряд готов и можно стрелять — бросаем
-    local canThrow = elapsed >= RB.ChargeTime
-        and (RB.ShootWall or isVisible(myRoot.Position, targetRoot, targetChar))
+    -- ТОЛЬКО в голову: прицел строится только при наличии головы
+    local aimPos = computeAimPos(myRoot, targetRoot, targetChar)
+    if not aimPos then
+        return
+    end
 
-    if canThrow then
-        -- последнее уточнение прицела + тихий бросок ровно в голову
-        silentThrow(computeAimPos(myRoot, targetRoot, targetChar))
-        holding = false -- отпустили; на следующем тике зажмём снова
-    elseif elapsed >= aimStartAt then
+    if elapsed >= RB.ChargeTime then
+        -- реально ли куда лететь: стена / решётка / стекло
+        local shootable = pathAllows(checkShotPath(myRoot, targetRoot, targetChar))
+        if not shootable then
+            -- путь закрыт — пробуем другую цель с открытым прострелом
+            local altRoot, altChar = pickTarget(targetRoot)
+            local altAim = altRoot and computeAimPos(myRoot, altRoot, altChar)
+            if altAim and pathAllows(checkShotPath(myRoot, altRoot, altChar)) then
+                targetRoot, targetChar, aimPos = altRoot, altChar, altAim
+                shootable = true
+            end
+        end
+
+        if shootable then
+            silentThrow(aimPos)
+            -- сразу зажимаем ЛКМ снова, если тул остался в руках (без задержки)
+            if char:FindFirstChildOfClass("Tool") then
+                lmbPress()
+                holding = true
+                holdStart = os.clock()
+            else
+                holding = false -- тул улетел — ждём возврата, само возьмётся
+            end
+            return
+        end
+
+        -- ни одного открытого прострела — держим заряд и ведём прицел,
+        -- пока цель или прострел не изменятся
+        silentAim(aimPos)
+        return
+    end
+
+    if elapsed >= aimStartAt then
         -- за AimLead секунд до броска — тихо ведём прицел на голове цели,
         -- обновляя его каждый тик, пока нож не кинется
-        silentAim(computeAimPos(myRoot, targetRoot, targetChar))
+        silentAim(aimPos)
     end
 end
 
 -- ---------- главный цикл RageBot ----------
 task.spawn(function()
     while true do
-        task.wait(0.03)
+        task.wait(0.01) -- быстрый отклик: обработка каждый кадр
         if not RB.Enabled then
             releaseLMB()
         else
@@ -741,6 +864,77 @@ RunService.RenderStepped:Connect(function()
     fovCircle.Position = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
 end)
 
+-- ---------- авто-замер скорости ножа (ловим кинутый снаряд) ----------
+local KNIFE_PART_WORDS = { "knife", "blade", "kunai", "shuriken", "throw" }
+local measuringParts = {}
+
+local function isKnifePartName(name)
+    local n = string.lower(name)
+    for _, w in ipairs(KNIFE_PART_WORDS) do
+        if n:find(w, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+workspace.DescendantAdded:Connect(function(obj)
+    if not obj:IsA("BasePart") then
+        return
+    end
+
+    -- ловим: нож по имени ВСЕГДА, либо любую часть сразу после НАШЕГО броска
+    local afterOurThrow = os.clock() - lastThrowT <= 0.4
+    if not (isKnifePartName(obj.Name) or afterOurThrow) then
+        return
+    end
+    if measuringParts[obj] then
+        return
+    end
+
+    -- не трогаем части персонажей
+    local p = obj.Parent
+    while p do
+        if p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") then
+            return
+        end
+        p = p.Parent
+    end
+
+    measuringParts[obj] = true
+    task.spawn(function()
+        local best = 0
+        local lastPos, lastT = obj.Position, os.clock()
+        local deadline = lastT + 3 -- снаряд обязан долететь быстрее
+        while obj and obj.Parent and os.clock() < deadline do
+            task.wait(0.05)
+            local now = os.clock()
+            local sp = obj.AssemblyLinearVelocity.Magnitude
+            if sp < 1 then -- движут через CFrame — считаем по смещению
+                local dt = now - lastT
+                if dt > 0 then
+                    sp = (obj.Position - lastPos).Magnitude / dt
+                end
+            end
+            lastPos, lastT = obj.Position, now
+            -- здравый смысл: скорость ножа, а не пуля/статика
+            if sp >= 15 and sp <= 400 and sp > best then
+                best = sp
+            end
+        end
+        measuringParts[obj] = nil
+
+        if best > 0 then
+            RB.MeasuredSpeed = math.floor(best + 0.5)
+            pcall(function()
+                if autoSpeedLabel and autoSpeedLabel.Set then
+                    autoSpeedLabel:Set("Авто-предикт: скорость ножа " .. RB.MeasuredSpeed .. " стад/с")
+                end
+            end)
+        end
+    end)
+end)
+
 -- ---------- меню RageBot ----------
 RageTab:CreateToggle({
     Name = "RageBot (авто-бросок ножом)",
@@ -769,7 +963,7 @@ RageTab:CreateSlider({
     Name = "Наводка на голову за (сек) до броска",
     Range = { 0, 1 },
     Increment = 0.05,
-    CurrentValue = 0.4,
+    CurrentValue = 0.7,
     Flag = "RB_AimLead",
     Callback = function(Value)
         RB.AimLead = Value
@@ -803,8 +997,19 @@ RageTab:CreateToggle({
     end,
 })
 
+RageTab:CreateToggle({
+    Name = "Авто-предикт (замер скорости ножа)",
+    CurrentValue = true,
+    Flag = "RB_AutoPredict",
+    Callback = function(Value)
+        RB.AutoPredict = Value
+    end,
+})
+
+autoSpeedLabel = RageTab:CreateLabel("Авто-предикт: кинь нож — замерю скорость сам")
+
 RageTab:CreateSlider({
-    Name = "Скорость ножа (для предикта)",
+    Name = "Скорость ножа (вручную, если авто выкл)",
     Range = { 20, 300 },
     Increment = 5,
     CurrentValue = 120,
