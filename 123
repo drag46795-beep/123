@@ -833,3 +833,288 @@ RageTab:CreateToggle({
         RB.ShowFOV = Value
     end,
 })
+
+-- ============================================================
+--  VISUALS -> ESP ИГРОКОВ (через стены)
+-- ============================================================
+VisualsTab:CreateSection("ESP")
+
+local ESP = {
+    Enabled = false,
+    Box     = true,   -- рамка вокруг игрока
+    Names   = true,   -- имя над головой
+    Health  = true,   -- полоска здоровья слева от бокса
+    Tracers = false,  -- линия снизу экрана к ногам
+    MaxDist = 1500,   -- дальность отображения в стадах (0 = везде)
+}
+
+local espCache = {} -- [Player] = { box, name, hpBack, hpFill, tracer }
+local ESP_RED = Color3.fromRGB(255, 70, 70)
+
+local function espDrawing(kind)
+    local ok, obj = pcall(function()
+        return Drawing.new(kind)
+    end)
+    if ok then
+        return obj
+    end
+    return nil
+end
+
+local function getEspSet(plr)
+    local set = espCache[plr]
+    if set then
+        return set
+    end
+
+    set = {
+        box    = espDrawing("Square"),
+        name   = espDrawing("Text"),
+        hpBack = espDrawing("Line"),
+        hpFill = espDrawing("Line"),
+        tracer = espDrawing("Line"),
+    }
+
+    pcall(function()
+        if set.box then
+            set.box.Thickness = 2
+            set.box.Filled = false
+            set.box.Color = ESP_RED
+            set.box.Visible = false
+        end
+        if set.name then
+            set.name.Center = true
+            set.name.Outline = true
+            set.name.OutlineColor = Color3.fromRGB(0, 0, 0)
+            set.name.Color = Color3.fromRGB(255, 255, 255)
+            set.name.Size = 15
+            pcall(function()
+                set.name.Font = Enum.Font.GothamBold
+            end)
+            set.name.Visible = false
+        end
+        if set.hpBack then
+            set.hpBack.Thickness = 4
+            set.hpBack.Color = Color3.fromRGB(0, 0, 0)
+            set.hpBack.Visible = false
+        end
+        if set.hpFill then
+            set.hpFill.Thickness = 2
+            set.hpFill.Visible = false
+        end
+        if set.tracer then
+            set.tracer.Thickness = 1
+            set.tracer.Color = ESP_RED
+            set.tracer.Visible = false
+        end
+    end)
+
+    espCache[plr] = set
+    return set
+end
+
+local function hideEspSet(set)
+    if not set then
+        return
+    end
+    for _, obj in pairs(set) do
+        if obj then
+            pcall(function()
+                obj.Visible = false
+            end)
+        end
+    end
+end
+
+local function hideAllEsp()
+    for _, set in pairs(espCache) do
+        hideEspSet(set)
+    end
+end
+
+local function destroyForPlayer(plr)
+    local set = espCache[plr]
+    if set then
+        for _, obj in pairs(set) do
+            if obj then
+                pcall(function()
+                    obj:Remove()
+                end)
+            end
+        end
+        espCache[plr] = nil
+    end
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+    destroyForPlayer(plr)
+end)
+
+-- Главный цикл ESP: обновление каждый кадр
+RunService.RenderStepped:Connect(function()
+    local cam = workspace.CurrentCamera
+    if not ESP.Enabled or not cam then
+        hideAllEsp()
+        return
+    end
+
+    local vp = cam.ViewportSize
+    local from = cam.CFrame.Position
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and not isTeammate(plr) then
+            local set = getEspSet(plr)
+            local char = plr.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+
+            local show = hum and root and hum.Health > 0
+            if show and ESP.MaxDist > 0 then
+                show = (root.Position - from).Magnitude <= ESP.MaxDist
+            end
+
+            if not show then
+                hideEspSet(set)
+            else
+                -- габариты персонажа → прямоугольник на экране
+                local okBox, cf, size = pcall(function()
+                    return char:GetBoundingBox()
+                end)
+
+                local minX, minY = math.huge, math.huge
+                local maxX, maxY = -math.huge, -math.huge
+                local anyBehind = false
+
+                if okBox and cf then
+                    local half = size * 0.5
+                    for sx = -1, 1, 2 do
+                        for sy = -1, 1, 2 do
+                            for sz = -1, 1, 2 do
+                                local world = cf:PointToWorldSpace(Vector3.new(half.X * sx, half.Y * sy, half.Z * sz))
+                                local sp = cam:WorldToViewportPoint(world)
+                                if sp.Z <= 0 then
+                                    anyBehind = true
+                                end
+                                minX = math.min(minX, sp.X)
+                                maxX = math.max(maxX, sp.X)
+                                minY = math.min(minY, sp.Y)
+                                maxY = math.max(maxY, sp.Y)
+                            end
+                        end
+                    end
+                end
+
+                local centerSp, centerOn = cam:WorldToViewportPoint(root.Position)
+                local visible = okBox and cf and centerOn and not anyBehind
+                    and maxX > 0 and minX < vp.X and maxY > 0 and minY < vp.Y
+
+                if not visible then
+                    hideEspSet(set)
+                else
+                    -- Бокс
+                    if set.box then
+                        set.box.Visible = ESP.Box
+                        if ESP.Box then
+                            set.box.Position = Vector2.new(minX, minY)
+                            set.box.Size = Vector2.new(maxX - minX, maxY - minY)
+                        end
+                    end
+
+                    -- Имя над боксом
+                    if set.name then
+                        set.name.Visible = ESP.Names
+                        if ESP.Names then
+                            set.name.Text = plr.DisplayName ~= "" and plr.DisplayName or plr.Name
+                            set.name.Position = Vector2.new((minX + maxX) / 2, minY - 18)
+                        end
+                    end
+
+                    -- Полоска здоровья слева от бокса (зелёный → красный)
+                    if set.hpBack and set.hpFill then
+                        local on = ESP.Health
+                        set.hpBack.Visible = on
+                        set.hpFill.Visible = on
+                        if on then
+                            local ratio = math.clamp(hum.Health / math.max(1, hum.MaxHealth), 0, 1)
+                            local barX = minX - 6
+                            set.hpBack.From = Vector2.new(barX, minY)
+                            set.hpBack.To = Vector2.new(barX, maxY)
+                            set.hpFill.From = Vector2.new(barX, minY)
+                            set.hpFill.To = Vector2.new(barX, minY + (maxY - minY) * ratio)
+                            set.hpFill.Color = Color3.fromHSV(ratio * 0.33, 1, 1)
+                        end
+                    end
+
+                    -- Трассер: снизу экрана к ногам
+                    if set.tracer then
+                        set.tracer.Visible = ESP.Tracers
+                        if ESP.Tracers then
+                            set.tracer.From = Vector2.new(vp.X / 2, vp.Y)
+                            set.tracer.To = Vector2.new((minX + maxX) / 2, maxY)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- ---------- меню ESP (вкладка Visuals) ----------
+VisualsTab:CreateToggle({
+    Name = "ESP игроков (через стены)",
+    CurrentValue = false,
+    Flag = "ESP_Master",
+    Callback = function(Value)
+        ESP.Enabled = Value
+        if not Value then
+            hideAllEsp()
+        end
+    end,
+})
+
+VisualsTab:CreateToggle({
+    Name = "ESP: Бокс",
+    CurrentValue = true,
+    Flag = "ESP_Box",
+    Callback = function(Value)
+        ESP.Box = Value
+    end,
+})
+
+VisualsTab:CreateToggle({
+    Name = "ESP: Имена",
+    CurrentValue = true,
+    Flag = "ESP_Names",
+    Callback = function(Value)
+        ESP.Names = Value
+    end,
+})
+
+VisualsTab:CreateToggle({
+    Name = "ESP: Здоровье",
+    CurrentValue = true,
+    Flag = "ESP_Health",
+    Callback = function(Value)
+        ESP.Health = Value
+    end,
+})
+
+VisualsTab:CreateToggle({
+    Name = "ESP: Трассеры",
+    CurrentValue = false,
+    Flag = "ESP_Tracers",
+    Callback = function(Value)
+        ESP.Tracers = Value
+    end,
+})
+
+VisualsTab:CreateSlider({
+    Name = "ESP: Дальность (0 = везде)",
+    Range = { 0, 3000 },
+    Increment = 100,
+    CurrentValue = 1500,
+    Flag = "ESP_Dist",
+    Callback = function(Value)
+        ESP.MaxDist = Value
+    end,
+})
