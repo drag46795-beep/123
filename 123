@@ -1,0 +1,87 @@
+-- Загрузка открытой UI библиотеки Rayfield
+local Rayfield = loadstring(game:HttpGet('https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua'))()
+
+local Lighting = game:GetService("Lighting")
+
+-- Текстуры для красивого звёздного неба
+local starryTextures = {
+    SkyboxBk = "http://www.roblox.com/asset/?id=159454299",
+    SkyboxDn = "http://www.roblox.com/asset/?id=159454296",
+    SkyboxFt = "http://www.roblox.com/asset/?id=159454293",
+    SkyboxLf = "http://www.roblox.com/asset/?id=159454286",
+    SkyboxRt = "http://www.roblox.com/asset/?id=159454300",
+    SkyboxUp = "http://www.roblox.com/asset/?id=159454288",
+    StarCount = 5000,
+    CelestialBodiesShown = true
+}
+
+-- Функция переключения звёздного неба
+local function setStarrySky(enable)
+    local existingSky = Lighting:FindFirstChild("CustomStarrySky")
+    
+    if enable then
+        local oldSky = Lighting:FindFirstChildOfClass("Sky")
+        if oldSky and oldSky.Name ~= "CustomStarrySky" then
+            oldSky:Destroy()
+        end
+
+        if not existingSky then
+            local sky = Instance.new("Sky")
+            sky.Name = "CustomStarrySky"
+            for prop, val in pairs(starryTextures) do
+                sky[prop] = val
+            end
+            sky.Parent = Lighting
+        end
+
+        Lighting.ClockTime = 0
+        Lighting.Brightness = 1
+        Lighting.OutdoorAmbient = Color3.fromRGB(60, 60, 90)
+    else
+        if existingSky then
+            existingSky:Destroy()
+        end
+        Lighting.ClockTime = 14
+        Lighting.Brightness = 2
+        Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+    end
+end
+
+-- Создание главного окна
+local Window = Rayfield:CreateWindow({
+    Name = "Custom Hub",
+    Icon = 0,
+    LoadingTitle = "Custom Interface",
+    LoadingSubtitle = "by Draggg",
+    Theme = "Default",
+    DisableRayfieldPrompts = false,
+    DisableBuildWarnings = false,
+    ConfigurationSaving = {
+        Enabled = false
+    }
+})
+
+-- Создание вкладок: Visuals, Legit, Rage
+local VisualsTab = Window:CreateTab("Visuals", 4483362458)
+local LegitTab = Window:CreateTab("Legit", 4483362458)
+local RageTab = Window:CreateTab("Rage", 4483362458)
+
+-- Вкладка Visuals
+VisualsTab:CreateSection("Окружение")
+
+VisualsTab:CreateToggle({
+    Name = "Starry Sky (Звёздное небо)",
+    CurrentValue = false,
+    Flag = "StarrySkyToggle",
+    Callback = function(Value)
+        setStarrySky(Value)
+    end,
+})
+
+-- Каркас для вкладки Legit
+LegitTab:CreateSection("Настройки Legit")
+LegitTab:CreateLabel("Раздел для пользовательских параметров")
+
+-- Каркас для вкладки Rage
+RageTab:CreateSection("Настройки Rage")
+RageTab:CreateLabel("Раздел для пользовательских параметров")
