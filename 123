@@ -82,6 +82,700 @@ VisualsTab:CreateToggle({
 LegitTab:CreateSection("Настройки Legit")
 LegitTab:CreateLabel("Раздел для пользовательских параметров")
 
--- Каркас для вкладки Rage
-RageTab:CreateSection("Настройки Rage")
-RageTab:CreateLabel("Раздел для пользовательских параметров")
+-- ============================================================
+--  RAGE -> AUTO FARM
+--  Лютая скорость + проход сквозь стены + авто-нож (1 слот)
+--  + автоматическая рубка всех врагов
+-- ============================================================
+RageTab:CreateSection("Auto Farm")
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+-- Настройки фермы
+local AF = {
+    Enabled    = false, -- мастер-включение всего
+    Speed      = 160,   -- лютая скорость (WalkSpeed)
+    Noclip     = true,  -- проход сквозь стены
+    AutoKnife  = true,  -- авто выбор ножа (1 слот)
+    KillAll    = true,  -- рубить всех врагов
+    TPToTarget = true,  -- телепорт к врагу (добивает даже за стеной)
+    Range      = 15,    -- дистанция удара
+    Interval   = 0.1,   -- как часто бьём (сек)
+}
+
+local savedSpeed = nil  -- скорость до включения (чтобы вернуть при выключении)
+local lastEquip = 0     -- кулдаун авто-эквипа ножа
+
+-- Отдельные фичи (работают независимо от Auto Farm)
+local Move = {
+    InfJump = false, -- Infinity Jump
+    Noclip  = false, -- отдельный Noclip
+}
+
+-- Вернуть коллизии тела (вызывается при выключении)
+local function restoreCollisions()
+    local char = LocalPlayer.Character
+    if char then
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                part.CanCollide = true
+            end
+        end
+    end
+end
+
+-- ==================== РАБОТА С НОЖОМ ====================
+local function isKnifeName(tool)
+    local n = tool.Name
+    local hay = string.lower(n) .. " " .. n
+    for _, word in ipairs({ "нож", "Нож", "knife", "blade", "machete", "sword", "kat" }) do
+        if hay:find(word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function getKnifeTool()
+    local char = LocalPlayer.Character
+    local held = char and char:FindFirstChildOfClass("Tool")
+
+    -- нож уже в руках — не трогаем
+    if held and isKnifeName(held) then
+        return held
+    end
+
+    -- ищем нож в рюкзаке (если не нашли по имени — берём 1-й слот)
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local named, first
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") then
+                first = first or tool -- это и есть "1 слот"
+                if isKnifeName(tool) then
+                    named = tool
+                    break
+                end
+            end
+        end
+    end
+    return named or first or held
+end
+
+local function equipKnife()
+    local tool = getKnifeTool()
+    if tool and tool.Parent ~= LocalPlayer.Character then
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            hum:EquipTool(tool)
+        end
+    end
+    return tool
+end
+
+-- Удар по цели: встать за спиной цели + взмах ножом
+local function strike(targetChar)
+    local char = LocalPlayer.Character
+    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+    local tRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+    if not (myRoot and tRoot) then
+        return
+    end
+
+    local knife = equipKnife()
+    if not knife then
+        return
+    end
+
+    if AF.TPToTarget then
+        -- встаём прямо за спиной цели — удар засчитывается даже сквозь стену
+        local behind = tRoot.CFrame * CFrame.new(0, 0, 2.5)
+        myRoot.CFrame = CFrame.lookAt(behind.Position, tRoot.Position)
+    else
+        myRoot.CFrame = CFrame.lookAt(myRoot.Position, tRoot.Position)
+    end
+
+    knife:Activate() -- взмах ножом
+end
+
+-- Главный цикл: рубим всех врагов
+task.spawn(function()
+    while true do
+        task.wait(math.max(0.05, AF.Interval))
+        if AF.Enabled and AF.KillAll then
+            pcall(function()
+                local char = LocalPlayer.Character
+                local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+                if not myRoot then
+                    return
+                end
+
+                local inRange, nearest, nearDist = {}, nil, math.huge
+
+                for _, plr in ipairs(Players:GetPlayers()) do
+                    if plr ~= LocalPlayer then
+                        local tc = plr.Character
+                        local hum = tc and tc:FindFirstChildOfClass("Humanoid")
+                        local root = tc and tc:FindFirstChild("HumanoidRootPart")
+                        if hum and root and hum.Health > 0 then
+                            local dist = (root.Position - myRoot.Position).Magnitude
+                            if dist < nearDist then
+                                nearest, nearDist = root, dist
+                            end
+                            if dist <= AF.Range then
+                                table.insert(inRange, root)
+                            end
+                        end
+                    end
+                end
+
+                if #inRange > 0 then
+                    -- режем всех, кто рядом
+                    for _, root in ipairs(inRange) do
+                        strike(root.Parent)
+                    end
+                elseif AF.TPToTarget and nearest then
+                    -- никого рядом — телепортируемся к ближайшему врагу
+                    strike(nearest.Parent)
+                end
+            end)
+        end
+    end
+end)
+
+-- Ноclip: выключаем коллизию тела (Auto Farm и/или отдельный переключатель)
+RunService.Stepped:Connect(function()
+    if not ((AF.Enabled and AF.Noclip) or Move.Noclip) then
+        return
+    end
+    local char = LocalPlayer.Character
+    if char then
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end
+end)
+
+-- Скорость + авто-нож (каждый кадр, чтобы игра не сбрасывала)
+RunService.Heartbeat:Connect(function()
+    if not AF.Enabled then
+        return
+    end
+    local char = LocalPlayer.Character
+    if not char then
+        return
+    end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then
+        return
+    end
+
+    -- запоминаем оригинальную скорость и ставим свою
+    if savedSpeed == nil then
+        savedSpeed = hum.WalkSpeed
+    end
+    if hum.WalkSpeed ~= AF.Speed then
+        hum.WalkSpeed = AF.Speed
+    end
+
+    -- авто-нож (1 слот), не чаще раза в 0.4с чтобы не спамить
+    if AF.AutoKnife and not char:FindFirstChildOfClass("Tool") and os.clock() - lastEquip > 0.4 then
+        equipKnife()
+        lastEquip = os.clock()
+    end
+end)
+
+-- После респавна снова берём нож в 1 слот
+LocalPlayer.CharacterAdded:Connect(function()
+    savedSpeed = nil
+    if AF.Enabled and AF.AutoKnife then
+        task.wait(1) -- ждём, пока нож положат в рюкзак
+        equipKnife()
+    end
+end)
+
+-- ==================== МЕНЮ ВКЛАДКИ RAGE ====================
+local statusLabel = RageTab:CreateLabel("Auto Farm: ВЫКЛ")
+
+local function setStatus(text)
+    if statusLabel and statusLabel.Set then
+        pcall(function()
+            statusLabel:Set(text)
+        end)
+    end
+end
+
+RageTab:CreateToggle({
+    Name = "Auto Farm (включить всё)",
+    CurrentValue = false,
+    Flag = "AutoFarmMaster",
+    Callback = function(Value)
+        AF.Enabled = Value
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+        if Value then
+            setStatus("Auto Farm: ВКЛ")
+        else
+            -- выключили: возвращаем скорость и коллизии
+            if hum then
+                hum.WalkSpeed = savedSpeed or 16
+            end
+            restoreCollisions()
+            savedSpeed = nil
+            setStatus("Auto Farm: ВЫКЛ")
+        end
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "Noclip (сквозь стены)",
+    CurrentValue = true,
+    Flag = "AF_Noclip",
+    Callback = function(Value)
+        AF.Noclip = Value
+    end,
+})
+
+RageTab:CreateSlider({
+    Name = "Лютая скорость",
+    Range = { 16, 500 },
+    Increment = 1,
+    CurrentValue = 160,
+    Flag = "AF_Speed",
+    Callback = function(Value)
+        AF.Speed = Value
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "Авто-нож (1 слот)",
+    CurrentValue = true,
+    Flag = "AF_AutoKnife",
+    Callback = function(Value)
+        AF.AutoKnife = Value
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "Резать всех (Kill Aura)",
+    CurrentValue = true,
+    Flag = "AF_KillAll",
+    Callback = function(Value)
+        AF.KillAll = Value
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "TP к врагу (удар через стену)",
+    CurrentValue = true,
+    Flag = "AF_TP",
+    Callback = function(Value)
+        AF.TPToTarget = Value
+    end,
+})
+
+RageTab:CreateSlider({
+    Name = "Дистанция удара",
+    Range = { 5, 100 },
+    Increment = 1,
+    CurrentValue = 15,
+    Flag = "AF_Range",
+    Callback = function(Value)
+        AF.Range = Value
+    end,
+})
+
+RageTab:CreateSlider({
+    Name = "Скорость ударов (интервал)",
+    Range = { 0.05, 1 },
+    Increment = 0.05,
+    CurrentValue = 0.1,
+    Flag = "AF_Interval",
+    Callback = function(Value)
+        AF.Interval = Value
+    end,
+})
+
+-- ============================================================
+--  RAGE -> ДВИЖЕНИЕ (Infinity Jump / Noclip)
+-- ============================================================
+local UIS = game:GetService("UserInputService")
+
+RageTab:CreateSection("Движение")
+
+RageTab:CreateToggle({
+    Name = "Infinity Jump",
+    CurrentValue = false,
+    Flag = "Move_InfJump",
+    Callback = function(Value)
+        Move.InfJump = Value
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "Noclip (отдельный)",
+    CurrentValue = false,
+    Flag = "Move_Noclip",
+    Callback = function(Value)
+        Move.Noclip = Value
+        if not Value then
+            restoreCollisions()
+        end
+    end,
+})
+
+-- Бесконечный прыжок: позволяем прыгать в воздухе сколько угодно раз
+UIS.JumpRequest:Connect(function()
+    if Move.InfJump then
+        pcall(function()
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                hum.Jump = true
+                hum:ChangeState(Enum.HumanoidStateType.Jumping)
+            end
+        end)
+    end
+end)
+
+-- ============================================================
+--  RAGE -> RAGEBOT (авто-заряд ЛКМ + тихий бросок ножом)
+--  Работает молча: камера не дёргается, персонаж не поворачивается
+-- ============================================================
+RageTab:CreateSection("RageBot")
+
+local RB = {
+    Enabled    = false, -- мастер RageBot
+    ChargeTime = 1,     -- сколько держать ЛКМ перед броском (сек)
+    ShootWall  = true,  -- стрелять через стены
+    AimWall    = true,  -- наводить (выбирать цель) через стены
+    Predict    = true,  -- предиктить движение цели
+    KnifeSpeed = 120,   -- скорость полёта ножа для предикта (стад/сек)
+    FOV        = 350,   -- радиус FOV в пикселях (0 = без лимита)
+    ShowFOV    = true,  -- рисовать круг FOV
+}
+
+local holding = false -- ЛКМ зажата
+local holdStart = 0   -- когда зажали
+
+-- ---------- мышь (ЛКМ) ----------
+local function lmbPress()
+    pcall(function()
+        if type(mouse1press) == "function" then
+            mouse1press()
+        else
+            local p = UIS:GetMouseLocation()
+            game:GetService("VirtualInputManager"):SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
+        end
+    end)
+end
+
+local function lmbRelease()
+    pcall(function()
+        if type(mouse1release) == "function" then
+            mouse1release()
+        else
+            local p = UIS:GetMouseLocation()
+            game:GetService("VirtualInputManager"):SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
+        end
+    end)
+end
+
+local function releaseLMB()
+    if holding then
+        lmbRelease()
+        holding = false
+    end
+end
+
+-- ---------- видимость цели (есть ли стена между мной и целью) ----------
+local function isVisible(fromPos, targetRoot, targetChar)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+
+    local hit = workspace:Raycast(fromPos, targetRoot.Position - fromPos, params)
+    if not hit then
+        return true
+    end
+    if hit.Instance:IsDescendantOf(targetChar) then
+        return true
+    end
+    return (hit.Position - targetRoot.Position).Magnitude < 3
+end
+
+local function isTeammate(plr)
+    if plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then
+        if plr.Neutral == false and LocalPlayer.Neutral == false then
+            return true
+        end
+    end
+    return false
+end
+
+-- ---------- выбор цели: живой враг в пределах FOV ----------
+local function pickTarget()
+    local char = LocalPlayer.Character
+    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+    local cam = workspace.CurrentCamera
+    if not (myRoot and cam) then
+        return nil, nil
+    end
+
+    local vp = cam.ViewportSize
+    local center = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+    local bestRoot, bestChar, bestDist = nil, nil, math.huge
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and not isTeammate(plr) then
+            local tc = plr.Character
+            local hum = tc and tc:FindFirstChildOfClass("Humanoid")
+            local root = tc and tc:FindFirstChild("HumanoidRootPart")
+            if hum and root and hum.Health > 0 then
+                local allowed = true
+                if not RB.AimWall then
+                    allowed = isVisible(myRoot.Position, root, tc)
+                end
+                if allowed then
+                    local sp = cam:WorldToViewportPoint(root.Position)
+                    local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                    if (RB.FOV <= 0 or d <= RB.FOV) and d < bestDist then
+                        bestRoot, bestChar, bestDist = root, tc, d
+                    end
+                end
+            end
+        end
+    end
+    return bestRoot, bestChar
+end
+
+-- ---------- предикт: куда кинуть, чтобы попасть ----------
+local function computeAimPos(myRoot, targetRoot)
+    local pos = targetRoot.Position
+    if RB.Predict then
+        local vel = targetRoot.AssemblyLinearVelocity or targetRoot.Velocity
+        local dist = (pos - myRoot.Position).Magnitude
+        local t = dist / math.max(1, RB.KnifeSpeed)
+        pos = pos + vel * t
+        -- если нож летит по дуге — раскомментируй (прицел будет выше):
+        -- pos = pos + Vector3.new(0, 0.5 * workspace.Gravity * t * t, 0)
+    end
+    return pos
+end
+
+-- ---------- тихий бросок: направление меняется только внутри кадра ----------
+local function silentThrow(aimPos)
+    local cam = workspace.CurrentCamera
+    if not cam then
+        return
+    end
+    local oldCF = cam.CFrame
+    if (aimPos - oldCF.Position).Magnitude < 1 then
+        return
+    end
+    local newCF = CFrame.lookAt(oldCF.Position, aimPos)
+    cam.CFrame = newCF
+    lmbRelease()
+    -- возвращаем камеру до рендера: глаза игрока поворот не видит,
+    -- но игра уже прочитала направление на бросок
+    task.spawn(function()
+        RunService.RenderStepped:Wait()
+        pcall(function()
+            if cam.CFrame == newCF then
+                cam.CFrame = oldCF
+            end
+        end)
+    end)
+end
+
+-- ---------- один тик логики RageBot ----------
+local function ragebotTick()
+    local char = LocalPlayer.Character
+    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+    if not myRoot then
+        releaseLMB()
+        return
+    end
+
+    -- ножа в руках нет — пытаемся взять (1 слот)
+    local knife = char:FindFirstChildOfClass("Tool")
+    if not (knife and isKnifeName(knife)) then
+        if os.clock() - lastEquip > 0.4 then
+            equipKnife()
+            lastEquip = os.clock()
+        end
+        releaseLMB()
+        return
+    end
+
+    local targetRoot, targetChar = pickTarget()
+
+    -- нож в руках — зажимаем ЛКМ и заряжаем
+    if not holding then
+        lmbPress()
+        holding = true
+        holdStart = os.clock()
+        return
+    end
+
+    -- ждём полную зарядку
+    if os.clock() - holdStart < RB.ChargeTime then
+        return
+    end
+
+    -- цели нет — сидим заряженным и ждём
+    if not targetRoot then
+        return
+    end
+
+    -- стрелять через стены нельзя — ждём, пока цель будет видна
+    if not RB.ShootWall and not isVisible(myRoot.Position, targetRoot, targetChar) then
+        return
+    end
+
+    -- тихий бросок
+    silentThrow(computeAimPos(myRoot, targetRoot))
+    holding = false -- отпустили; на следующем тике зажмём снова
+end
+
+-- ---------- главный цикл RageBot ----------
+task.spawn(function()
+    while true do
+        task.wait(0.03)
+        if not RB.Enabled then
+            releaseLMB()
+        else
+            local ok, err = pcall(ragebotTick)
+            if not ok then
+                warn("[RageBot] " .. tostring(err))
+            end
+        end
+    end
+end)
+
+-- ---------- круг FOV ----------
+local fovCircle = nil
+
+local function ensureFOVCircle()
+    if fovCircle then
+        return true
+    end
+    local ok = pcall(function()
+        fovCircle = Drawing.new("Circle")
+        fovCircle.Thickness = 2
+        fovCircle.NumSegments = 64
+        fovCircle.Filled = false
+        fovCircle.Color = Color3.fromRGB(255, 70, 70)
+        fovCircle.Transparency = 1
+        fovCircle.Visible = false
+    end)
+    return ok and fovCircle ~= nil
+end
+
+RunService.RenderStepped:Connect(function()
+    local show = RB.Enabled and RB.ShowFOV and RB.FOV > 0
+    if not show then
+        if fovCircle then
+            fovCircle.Visible = false
+        end
+        return
+    end
+    if not ensureFOVCircle() then
+        return
+    end
+    local cam = workspace.CurrentCamera
+    if not cam then
+        return
+    end
+    local vp = cam.ViewportSize
+    fovCircle.Visible = true
+    fovCircle.Radius = RB.FOV
+    fovCircle.Position = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+end)
+
+-- ---------- меню RageBot ----------
+RageTab:CreateToggle({
+    Name = "RageBot (авто-бросок ножом)",
+    CurrentValue = false,
+    Flag = "RageBot_Master",
+    Callback = function(Value)
+        RB.Enabled = Value
+        if not Value then
+            releaseLMB()
+        end
+    end,
+})
+
+RageTab:CreateSlider({
+    Name = "Заряд до броска (сек)",
+    Range = { 0.1, 3 },
+    Increment = 0.1,
+    CurrentValue = 1,
+    Flag = "RB_Charge",
+    Callback = function(Value)
+        RB.ChargeTime = Value
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "Стрелять через стены",
+    CurrentValue = true,
+    Flag = "RB_ShootWall",
+    Callback = function(Value)
+        RB.ShootWall = Value
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "Наводить через стены",
+    CurrentValue = true,
+    Flag = "RB_AimWall",
+    Callback = function(Value)
+        RB.AimWall = Value
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "Предиктить движение",
+    CurrentValue = true,
+    Flag = "RB_Predict",
+    Callback = function(Value)
+        RB.Predict = Value
+    end,
+})
+
+RageTab:CreateSlider({
+    Name = "Скорость ножа (для предикта)",
+    Range = { 20, 300 },
+    Increment = 5,
+    CurrentValue = 120,
+    Flag = "RB_KnifeSpeed",
+    Callback = function(Value)
+        RB.KnifeSpeed = Value
+    end,
+})
+
+RageTab:CreateSlider({
+    Name = "FOV (0 = без лимита)",
+    Range = { 0, 1000 },
+    Increment = 10,
+    CurrentValue = 350,
+    Flag = "RB_FOV",
+    Callback = function(Value)
+        RB.FOV = Value
+    end,
+})
+
+RageTab:CreateToggle({
+    Name = "Показывать круг FOV",
+    CurrentValue = true,
+    Flag = "RB_ShowFOV",
+    Callback = function(Value)
+        RB.ShowFOV = Value
+    end,
+})
