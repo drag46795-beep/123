@@ -452,6 +452,7 @@ RageTab:CreateSection("RageBot")
 local RB = {
     Enabled    = false, -- мастер RageBot
     ChargeTime = 1,     -- сколько держать ЛКМ перед броском (сек)
+    AimLead    = 0.4,   -- за сколько секунд до броска начинать наводку на голову
     ShootWall  = true,  -- стрелять через стены
     AimWall    = true,  -- наводить (выбирать цель) через стены
     Predict    = true,  -- предиктить движение цели
@@ -518,6 +519,25 @@ local function isTeammate(plr)
     return false
 end
 
+-- ---------- проверка на god mode: в таких целях бессмысленно целяться ----------
+local function isGodMode(targetChar, hum)
+    -- спавн-щит (ForceField) = неуязвимость
+    if targetChar:FindFirstChildOfClass("ForceField") then
+        return true
+    end
+    -- бесконечное здоровье — классический god mode
+    if hum.Health == math.huge or hum.MaxHealth == math.huge then
+        return true
+    end
+    -- распространённые атрибуты неуязвимости
+    for _, attr in ipairs({ "GodMode", "God", "godmode", "Invincible", "Immortal" }) do
+        if targetChar:GetAttribute(attr) == true or hum:GetAttribute(attr) == true then
+            return true
+        end
+    end
+    return false
+end
+
 -- ---------- выбор цели: живой враг в пределах FOV ----------
 local function pickTarget()
     local char = LocalPlayer.Character
@@ -536,7 +556,7 @@ local function pickTarget()
             local tc = plr.Character
             local hum = tc and tc:FindFirstChildOfClass("Humanoid")
             local root = tc and tc:FindFirstChild("HumanoidRootPart")
-            if hum and root and hum.Health > 0 then
+            if hum and root and hum.Health > 0 and not isGodMode(tc, hum) then
                 local allowed = true
                 if not RB.AimWall then
                     allowed = isVisible(myRoot.Position, root, tc)
@@ -554,9 +574,18 @@ local function pickTarget()
     return bestRoot, bestChar
 end
 
--- ---------- предикт: куда кинуть, чтобы попасть ----------
-local function computeAimPos(myRoot, targetRoot)
-    local pos = targetRoot.Position
+-- ---------- куда целиться: ровно в голову цели ----------
+local function getAimBasePos(targetRoot, targetChar)
+    local head = targetChar and targetChar:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then
+        return head.Position
+    end
+    return targetRoot.Position + Vector3.new(0, 1.5, 0) -- запасной вариант (головы нет)
+end
+
+-- ---------- предикт: куда кинуть, чтобы попасть в голову ----------
+local function computeAimPos(myRoot, targetRoot, targetChar)
+    local pos = getAimBasePos(targetRoot, targetChar)
     if RB.Predict then
         local vel = targetRoot.AssemblyLinearVelocity or targetRoot.Velocity
         local dist = (pos - myRoot.Position).Magnitude
@@ -568,21 +597,20 @@ local function computeAimPos(myRoot, targetRoot)
     return pos
 end
 
--- ---------- тихий бросок: направление меняется только внутри кадра ----------
-local function silentThrow(aimPos)
+-- ---------- тихая наводка: направление меняется только внутри кадра ----------
+local function applySilentAim(aimPos)
     local cam = workspace.CurrentCamera
     if not cam then
-        return
+        return false
     end
     local oldCF = cam.CFrame
     if (aimPos - oldCF.Position).Magnitude < 1 then
-        return
+        return false
     end
     local newCF = CFrame.lookAt(oldCF.Position, aimPos)
     cam.CFrame = newCF
-    lmbRelease()
     -- возвращаем камеру до рендера: глаза игрока поворот не видит,
-    -- но игра уже прочитала направление на бросок
+    -- но игра уже читает направление на цель
     task.spawn(function()
         RunService.RenderStepped:Wait()
         pcall(function()
@@ -591,6 +619,18 @@ local function silentThrow(aimPos)
             end
         end)
     end)
+    return true
+end
+
+-- молча держим прицел на голове (пока нож заряжается / ждёт момента)
+local function silentAim(aimPos)
+    applySilentAim(aimPos)
+end
+
+-- тихий бросок: ставим прицел и отпускаем ЛКМ в тот же момент
+local function silentThrow(aimPos)
+    applySilentAim(aimPos)
+    lmbRelease()
 end
 
 -- ---------- один тик логики RageBot ----------
@@ -623,24 +663,27 @@ local function ragebotTick()
         return
     end
 
-    -- ждём полную зарядку
-    if os.clock() - holdStart < RB.ChargeTime then
-        return
-    end
+    local elapsed = os.clock() - holdStart
+    local aimStartAt = math.max(0, RB.ChargeTime - RB.AimLead)
 
     -- цели нет — сидим заряженным и ждём
     if not targetRoot then
         return
     end
 
-    -- стрелять через стены нельзя — ждём, пока цель будет видна
-    if not RB.ShootWall and not isVisible(myRoot.Position, targetRoot, targetChar) then
-        return
-    end
+    -- заряд готов и можно стрелять — бросаем
+    local canThrow = elapsed >= RB.ChargeTime
+        and (RB.ShootWall or isVisible(myRoot.Position, targetRoot, targetChar))
 
-    -- тихий бросок
-    silentThrow(computeAimPos(myRoot, targetRoot))
-    holding = false -- отпустили; на следующем тике зажмём снова
+    if canThrow then
+        -- последнее уточнение прицела + тихий бросок ровно в голову
+        silentThrow(computeAimPos(myRoot, targetRoot, targetChar))
+        holding = false -- отпустили; на следующем тике зажмём снова
+    elseif elapsed >= aimStartAt then
+        -- за AimLead секунд до броска — тихо ведём прицел на голове цели,
+        -- обновляя его каждый тик, пока нож не кинется
+        silentAim(computeAimPos(myRoot, targetRoot, targetChar))
+    end
 end
 
 -- ---------- главный цикл RageBot ----------
@@ -719,6 +762,17 @@ RageTab:CreateSlider({
     Flag = "RB_Charge",
     Callback = function(Value)
         RB.ChargeTime = Value
+    end,
+})
+
+RageTab:CreateSlider({
+    Name = "Наводка на голову за (сек) до броска",
+    Range = { 0, 1 },
+    Increment = 0.05,
+    CurrentValue = 0.4,
+    Flag = "RB_AimLead",
+    Callback = function(Value)
+        RB.AimLead = Value
     end,
 })
 
